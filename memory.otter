@@ -1,0 +1,298 @@
+link "kernel32.dll" ~> VirtualAlloc(
+  lpAddress:rawptr,
+  dwSize:int,
+  flAllocationType:int,
+  flProtect:int
+) -> rawptr;
+
+link "kernel32.dll" ~> VirtualFree(
+  lpAddress:rawptr,
+  dwSize:int,
+  dwFreeType:int
+) -> bool;
+
+link "kernel32.dll" ~> RtlMoveMemory(
+  destination:rawptr,
+  source:rawptr,
+  length:int
+) -> void;
+
+link "kernel32.dll" ~> lstrlenA(text:str) -> int;
+
+link 9 ~> __linux_mmap(
+  addr:rawptr,
+  len:int,
+  prot:int,
+  flags:int,
+  fd:int,
+  off:int
+) -> rawptr;
+
+link 11 ~> __linux_munmap(addr:rawptr, len:int) -> int;
+
+link 33554629 ~> __macos_mmap(
+  addr:rawptr,
+  len:int,
+  prot:int,
+  flags:int,
+  fd:int,
+  off:int
+) -> rawptr;
+
+link 33554441 ~> __macos_munmap(addr:rawptr, len:int) -> int;
+
+link 0 ~> syscall(
+  num:int,
+  a1:int,
+  a2:int,
+  a3:int,
+  a4:int,
+  a5:int,
+  a6:int
+) -> int;
+
+/**
+ * Allocates a contiguous block of memory.
+ * On Windows, uses VirtualAlloc with MEM_COMMIT (0x1000) and PAGE_READWRITE (4).
+ * On Linux/macOS, uses mmap with PROT_READ|PROT_WRITE and MAP_PRIVATE|MAP_ANONYMOUS.
+ * Unix allocations store the requested size in the first 8 bytes and return
+ * a pointer offset by 8, enabling free() to recover the mapping length.
+ * @param size  Number of usable bytes to allocate
+ * @returns     Pointer to the usable region, or null on failure
+ */
+~> alloc(size:int) -> rawptr {
+  flow p:rawptr = null;
+  match (PLATFORM) {
+    1 -> {
+      p = VirtualAlloc(null, size, 4096, 4);
+      return p;
+    };
+    0 -> {
+      p = __linux_mmap(null, size + 8, 3, 34, -1, 0);
+    };
+    2 -> {
+      p = __macos_mmap(null, size + 8, 3, 4098, -1, 0);
+    };
+    _ -> {
+      p = VirtualAlloc(null, size, 4096, 4);
+      return p;
+    };
+  }
+
+  match (p == null) {
+    true -> {
+      return null;
+    };
+    _ -> {
+      flow p_as_int:int = p;
+      *p = size;
+      return p @ 8;
+    };
+  }
+}
+
+/**
+ * Releases a previously allocated memory block.
+ * On Windows, calls VirtualFree with MEM_RELEASE (0x8000).
+ * On Linux/macOS, recovers the original mmap base by subtracting the 8-byte
+ * size header, then calls munmap with the stored length.
+ * Passing null is a safe no-op.
+ * @param ptr  Pointer obtained from alloc(), or null
+ */
+~> free(ptr:rawptr) {
+  match (ptr == null) {
+    true -> {
+      return;
+    };
+    _ -> {};
+  }
+
+  match (PLATFORM) {
+    1 -> {
+      VirtualFree(ptr, 0, 32768);
+    };
+    0 -> {
+      rock original_ptr_linux:rawptr = ptr @ -8;
+      rock size_linux:int = *original_ptr_linux;
+      __linux_munmap(original_ptr_linux, size_linux + 8);
+    };
+    2 -> {
+      rock original_ptr_mac:rawptr = ptr @ -8;
+      rock size_mac:int = *original_ptr_mac;
+      __macos_munmap(original_ptr_mac, size_mac + 8);
+    };
+    _ -> {
+      VirtualFree(ptr, 0, 32768);
+    };
+  }
+}
+
+/**
+ * Copies n bytes from src to dst, returning dst.
+ * On Windows, delegates to kernel32 RtlMoveMemory.
+ * On Unix, performs a manual 8-byte-word copy loop followed by a
+ * partial-word copy for any remaining bytes using bitmask merging.
+ * @param dst  Destination pointer
+ * @param src  Source pointer
+ * @param n    Number of bytes to copy
+ * @returns    The destination pointer
+ */
+~> memcpy(dst:rawptr, src:rawptr, n:int) -> rawptr {
+  match (PLATFORM_WINDOWS) {
+    true -> {
+      RtlMoveMemory(dst, src, n);
+      return dst;
+    };
+    _ -> {
+      flow i:int = 0;
+      flow words:int = n / 8;
+
+      loop (i < words) {
+        rock offset:int = i * 8;
+        rock s_ptr:rawptr = src @ offset;
+        rock d_ptr:rawptr = dst @ offset;
+        *d_ptr = *s_ptr;
+        i = i + 1;
+      }
+
+      rock rem:int = n % 8;
+      match (rem > 0) {
+        true -> {
+          rock offset_rem:int = words * 8;
+          rock s_ptr_rem:rawptr = src @ offset_rem;
+          rock d_ptr_rem:rawptr = dst @ offset_rem;
+
+          rock src_word:int = *s_ptr_rem;
+          rock dst_word:int = *d_ptr_rem;
+
+          rock shift:int = rem * 8;
+          flow mask:int = 1;
+          flow j:int = 0;
+          loop (j < shift) {
+            mask = mask * 2;
+            j = j + 1;
+          }
+          mask = mask - 1;
+
+          rock src_part:int = src_word & mask;
+          rock dst_mask:int = dst_word & mask;
+          rock dst_part:int = dst_word - dst_mask;
+
+          rock combined:int = src_part + dst_part;
+          *d_ptr_rem = combined;
+        };
+        _ -> {};
+      }
+      return dst;
+    };
+  }
+}
+
+/**
+ * Returns the byte length of a null-terminated string, excluding the terminator.
+ * On Windows, delegates to kernel32 lstrlenA.
+ * On Unix, performs a manual byte-by-byte scan checking for a zero byte
+ * by masking each 8-byte word with 0xFF.
+ * @param text  The null-terminated string to measure
+ * @returns     Number of bytes before the null terminator
+ */
+~> strlen(text:str) -> int {
+  match (PLATFORM_WINDOWS) {
+    true -> {
+      return lstrlenA(text);
+    };
+    _ -> {
+      flow i:int = 0;
+      flow done:bool = false;
+      loop (!done) {
+        rock p:rawptr = text @ i;
+        rock word:int = *p;
+        rock b:int = word & 255;
+        match (b == 0) {
+          true -> {
+            done = true;
+          };
+          _ -> {
+            i += 1;
+          };
+        }
+      }
+      return i;
+    };
+  }
+}
+
+/**
+ * Converts an integer to its base-10 string representation.
+ * Handles zero and negative values. Allocates a new buffer via alloc()
+ * with enough space for all digits plus an optional minus sign and null terminator.
+ * @param value  The integer to convert
+ * @returns      A newly allocated string containing the decimal representation
+ */
+~> str_from_int(value:int) -> str {
+  match (value == 0) {
+    true -> {
+      return "0";
+    };
+    _ -> {};
+  }
+
+  flow n:int = value;
+  flow is_neg:bool = n < 0;
+  match (is_neg) {
+    true -> { n = 0 - n; };
+    _ -> {};
+  }
+
+  flow num_digits:int = 0;
+  flow tmp:int = n;
+  loop (tmp > 0) {
+    num_digits += 1;
+    tmp /= 10;
+  }
+
+  flow total_len:int = num_digits;
+  match (is_neg) {
+    true -> { total_len += 1; };
+    _ -> {};
+  }
+
+  rock buf:rawptr = alloc(total_len + 1);
+  buf[total_len] = 0;
+
+  flow pos:int = total_len - 1;
+  flow remaining:int = n;
+  loop (remaining > 0) {
+    rock digit:int = remaining % 10;
+    buf[pos] = digit + 48;
+    pos -= 1;
+    remaining /= 10;
+  }
+
+  match (is_neg) {
+    true -> { buf[0] = 45; };
+    _ -> {};
+  }
+
+  return buf;
+}
+
+/**
+ * Concatenates two strings into a newly allocated buffer.
+ * The result is null-terminated. The caller is responsible for
+ * freeing the returned pointer when it is no longer needed.
+ * @param a  First string
+ * @param b  Second string
+ * @returns  A new string containing a followed by b
+ */
+~> str_concat(a:str, b:str) -> str {
+  rock len_a:int = strlen(a);
+  rock len_b:int = strlen(b);
+  rock total:int = len_a + len_b + 1;
+  rock buf:rawptr = alloc(total);
+  memcpy(buf, a, len_a);
+  rock dst:rawptr = buf @ len_a;
+  memcpy(dst, b, len_b);
+  buf[len_a + len_b] = 0;
+  return buf;
+}
