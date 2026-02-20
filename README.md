@@ -1,6 +1,6 @@
 ﻿# memory
 
-Cross-platform memory allocation and string operations for Otter.
+Cross-platform memory allocation for Otter.
 
 Uses `VirtualAlloc`/`VirtualFree` on Windows, `mmap`/`munmap` on Linux/macOS — no libc dependency.
 
@@ -13,7 +13,7 @@ Allocate `size` bytes of memory. Returns a raw pointer to the allocated block.
 - **Parameters:**
   - `size` — Number of bytes to allocate (minimum 1)
 - **Returns:** `rawptr` to the allocated memory, or null on failure
-- **Platform:** Uses `VirtualAlloc` (Windows), `mmap` (Linux), `mmap` (macOS)
+- **Platform:** Uses `VirtualAlloc` (Windows), `mmap` (Linux/macOS)
 
 ```otter
 rock buf:rawptr = memory.alloc(1024);
@@ -69,35 +69,8 @@ Count the number of bytes in a null-terminated string (excluding the null termin
 rock len:int = memory.strlen("hello");  // 5
 ```
 
----
-
-### `memory.str_from_int(value:int) -> str`
-
-Convert an integer to its string representation. Handles negative numbers.
-
-- **Parameters:**
-  - `value` — Integer to convert
-- **Returns:** New string containing the decimal representation
-
-```otter
-rock s:str = memory.str_from_int(42);     // "42"
-rock neg:str = memory.str_from_int(-7);   // "-7"
-```
-
----
-
-### `memory.str_concat(a:str, b:str) -> str`
-
-Concatenate two strings into a new allocated string.
-
-- **Parameters:**
-  - `a` — First string
-  - `b` — Second string
-- **Returns:** New string `a + b`
-
-```otter
-rock full:str = memory.str_concat("hello ", "world");  // "hello world"
-```
+> **Note:** Integer-to-string conversion and string concatenation are built into the language.
+> Use `(str)x` to cast and `"a" + "b"` to concatenate — no imports needed.
 
 ## Dependencies
 

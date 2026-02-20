@@ -152,7 +152,7 @@ link 0 ~> syscall(
         rock s_ptr:rawptr = src @ offset;
         rock d_ptr:rawptr = dst @ offset;
         *d_ptr = *s_ptr;
-        i = i + 1;
+        i += 1;
       }
 
       rock rem:int = n % 8;
@@ -170,9 +170,9 @@ link 0 ~> syscall(
           flow j:int = 0;
           loop (j < shift) {
             mask = mask * 2;
-            j = j + 1;
+            j += 1;
           }
-          mask = mask - 1;
+          mask -= 1;
 
           rock src_part:int = src_word & mask;
           rock dst_mask:int = dst_word & mask;
