@@ -1,0 +1,124 @@
+use memory;
+use test;
+
+~> main() -> void {
+
+  // ══════════════ ALLOC / FREE ══════════════
+
+  // Basic allocation returns non-null
+  rock buf:rawptr = memory.alloc(64);
+  test.assert(buf != null, "FAIL: alloc(64) returned null");
+
+
+  // ══════════════ BYTE WRITE / READ ══════════════
+
+  buf[0] = 65;  // 'A'
+  test.eq(buf[0], 65, "FAIL: byte[0] write/read = 65");
+
+  buf[1] = 66;  // 'B'
+  test.eq(buf[1], 66, "FAIL: byte[1] write/read = 66");
+
+  buf[2] = 0;
+  test.eq(buf[2], 0, "FAIL: byte[2] write/read = 0");
+
+
+  // ══════════════ SEQUENTIAL BYTE FILL ══════════════
+
+  flow i:int = 0;
+  loop (i < 10) {
+    buf[i] = i + 48;  // '0'..'9'
+    i += 1;
+  }
+  test.eq(buf[0], 48, "FAIL: buf[0] = '0' = 48");
+  test.eq(buf[4], 52, "FAIL: buf[4] = '4' = 52");
+  test.eq(buf[9], 57, "FAIL: buf[9] = '9' = 57");
+
+
+  // ══════════════ FREE ══════════════
+
+  // Free should not crash
+  memory.free(buf);
+
+  // Free null should be safe no-op
+  memory.free(null);
+
+
+  // ══════════════ STRLEN ══════════════
+
+  test.eq(memory.strlen("hello"), 5, "FAIL: strlen(hello) = 5");
+  test.eq(memory.strlen(""), 0, "FAIL: strlen(\"\") = 0");
+  test.eq(memory.strlen("a"), 1, "FAIL: strlen(a) = 1");
+  test.eq(memory.strlen("abcdef"), 6, "FAIL: strlen(abcdef) = 6");
+
+
+  // ══════════════ MEMCPY ══════════════
+
+  rock src:rawptr = memory.alloc(16);
+  rock dst:rawptr = memory.alloc(16);
+
+  // Fill source with known bytes
+  src[0] = 10;
+  src[1] = 20;
+  src[2] = 30;
+  src[3] = 40;
+  src[4] = 50;
+
+  // Copy 5 bytes
+  memory.memcpy(dst, src, 5);
+
+  test.eq(dst[0], 10, "FAIL: memcpy dst[0] = 10");
+  test.eq(dst[1], 20, "FAIL: memcpy dst[1] = 20");
+  test.eq(dst[2], 30, "FAIL: memcpy dst[2] = 30");
+  test.eq(dst[3], 40, "FAIL: memcpy dst[3] = 40");
+  test.eq(dst[4], 50, "FAIL: memcpy dst[4] = 50");
+
+
+  // ══════════════ MEMCPY DOES NOT OVER-COPY ══════════════
+
+  rock src2:rawptr = memory.alloc(16);
+  rock dst2:rawptr = memory.alloc(16);
+
+  // Fill all of dst2 with 0xFF first
+  flow j:int = 0;
+  loop (j < 8) {
+    dst2[j] = 255;
+    j += 1;
+  }
+
+  // Fill src2 with 1,2,3
+  src2[0] = 1;
+  src2[1] = 2;
+  src2[2] = 3;
+
+  // Copy only 3 bytes
+  memory.memcpy(dst2, src2, 3);
+
+  test.eq(dst2[0], 1, "FAIL: partial memcpy dst2[0] = 1");
+  test.eq(dst2[1], 2, "FAIL: partial memcpy dst2[1] = 2");
+  test.eq(dst2[2], 3, "FAIL: partial memcpy dst2[2] = 3");
+
+
+  // ══════════════ ALLOC MULTIPLE BLOCKS ══════════════
+
+  rock block1:rawptr = memory.alloc(32);
+  rock block2:rawptr = memory.alloc(32);
+
+  // They should be different pointers
+  test.assert(block1 != block2, "FAIL: two allocs give different ptrs");
+
+  // Write to one shouldn't affect the other
+  block1[0] = 111;
+  block2[0] = 222;
+  test.eq(block1[0], 111, "FAIL: block1[0] = 111");
+  test.eq(block2[0], 222, "FAIL: block2[0] = 222");
+
+  memory.free(block1);
+  memory.free(block2);
+  memory.free(src);
+  memory.free(dst);
+  memory.free(src2);
+  memory.free(dst2);
+
+
+  test.ok("test_alloc: all passed");
+}

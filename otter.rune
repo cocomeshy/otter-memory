@@ -1,14 +1,6 @@
 rune 1
 name "memory"
 version "1.0.0"
-description "Cross-platform memory allocation, deallocation, copy, and string length operations"
+description "Standard library memory package"
 author "cocomeshy"
 license "MIT"
-entry memory.otter
-
-export alloc
-export free
-export memcpy
-export strlen
-export str_from_int
-export str_concat
