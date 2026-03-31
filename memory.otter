@@ -130,8 +130,8 @@ link 0 ~> syscall(
 /**
  * Copies n bytes from src to dst, returning dst.
  * On Windows, delegates to kernel32 RtlMoveMemory.
- * On Unix, performs a manual 8-byte-word copy loop followed by a
- * partial-word copy for any remaining bytes using bitmask merging.
+ * On Unix, copies byte-by-byte (must not use *rawptr word loads — they read
+ * 8 bytes and can fault past the end of small buffers).
  * @param dst  Destination pointer
  * @param src  Source pointer
  * @param n    Number of bytes to copy
@@ -145,43 +145,9 @@ link 0 ~> syscall(
     };
     _ -> {
       flow i:int = 0;
-      flow words:int = n / 8;
-
-      loop (i < words) {
-        rock offset:int = i * 8;
-        rock s_ptr:rawptr = src @ offset;
-        rock d_ptr:rawptr = dst @ offset;
-        *d_ptr = *s_ptr;
-        i = i + 1;
-      }
-
-      rock rem:int = n % 8;
-      match (rem > 0) {
-        true -> {
-          rock offset_rem:int = words * 8;
-          rock s_ptr_rem:rawptr = src @ offset_rem;
-          rock d_ptr_rem:rawptr = dst @ offset_rem;
-
-          rock src_word:int = *s_ptr_rem;
-          rock dst_word:int = *d_ptr_rem;
-
-          rock shift:int = rem * 8;
-          flow mask:int = 1;
-          flow j:int = 0;
-          loop (j < shift) {
-            mask = mask * 2;
-            j = j + 1;
-          }
-          mask = mask - 1;
-
-          rock src_part:int = src_word & mask;
-          rock dst_mask:int = dst_word & mask;
-          rock dst_part:int = dst_word - dst_mask;
-
-          rock combined:int = src_part + dst_part;
-          *d_ptr_rem = combined;
-        };
-        _ -> {};
+      loop (i < n) {
+        dst[i] = src[i];
+        i += 1;
       }
       return dst;
     };
