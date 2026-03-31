@@ -191,8 +191,8 @@ link 0 ~> syscall(
 /**
  * Returns the byte length of a null-terminated string, excluding the terminator.
  * On Windows, delegates to kernel32 lstrlenA.
- * On Unix, performs a manual byte-by-byte scan checking for a zero byte
- * by masking each 8-byte word with 0xFF.
+ * On Unix, scans one byte at a time via str indexing (must not use *rawptr,
+ * which loads 8 bytes and can read past the terminator and fault).
  * @param text  The null-terminated string to measure
  * @returns     Number of bytes before the null terminator
  */
@@ -205,9 +205,7 @@ link 0 ~> syscall(
       flow i:int = 0;
       flow done:bool = false;
       loop (!done) {
-        rock p:rawptr = text @ i;
-        rock word:int = *p;
-        rock b:int = word & 255;
+        rock b:int = text[i];
         match (b == 0) {
           true -> {
             done = true;
