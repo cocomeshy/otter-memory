@@ -61,84 +61,244 @@ link 0 ~> syscall(
 ) -> int;
 
 /**
- * Allocates a contiguous block of memory.
+ * The heap: size-class segregated freelists over 64 KiB mmap arenas.
+ *
+ * Every block carries a 16-byte header:
+ *   word0 = payload_capacity * 64 + class_id   (class 63 = large passthrough,
+ *           where payload_capacity is the total mmap length)
+ *   word1 = liveness magic: 2004318071 while live, 1717986918 after free.
+ * The distinct FREE magic lets free() tell a double-free apart from wild
+ * pointer corruption. Small classes (0..15) come from bump-allocated chunks
+ * and are recycled through per-class LIFO freelists: one mmap syscall per
+ * ~15-500 allocations instead of per allocation. Anything over 4096 bytes
+ * maps straight through to mmap/munmap as before.
+ *
+ * Freelist-recycled blocks are re-zeroed before reuse so alloc() keeps the
+ * mmap guarantee that memory arrives zero-filled (bignum code relies on it).
+ * Chunks are never unmapped; RSS is bounded by each class's high-water mark.
+ *
+ * Control block layout (one lazily mmap'd page, reached via __heap_ctl):
+ *   +0             spin lock word
+ *   +8   .. +127   freelist head per class (16 slots)
+ *   +136 .. +255   bump cursor per class
+ *   +264 .. +383   bump end per class
+ * The first allocation always happens on the main thread (worker threads
+ * are only created by thread.spawn, which itself allocates first), so the
+ * lazy init needs no synchronization; later concurrent alloc/free take the
+ * spin lock.
+ */
+
+global __heap_ctl:int = 0;
+
+// Raw anonymous rw mmap of n bytes (Unix only; callers guard PLATFORM).
+~> __heap_mmap(n:int) -> rawptr {
+  match (PLATFORM) {
+    0 -> { return __linux_mmap(null, n, 3, 34, -1, 0); };
+    2 -> { return __macos_mmap(null, n, 3, 4098, -1, 0); };
+    _ -> { return null; };
+  }
+}
+
+// Size class for a payload size (1..4096). 0..7 cover 16..128 in steps of
+// 16; 8..15 cover 192, 256, 384, 512, 768, 1024, 2048, 4096.
+~> __heap_class(size:int) -> int {
+  match (size <= 128) { true -> { return (size + 15) / 16 - 1; }; _ -> {}; }
+  match (size <= 192) { true -> { return 8; }; _ -> {}; }
+  match (size <= 256) { true -> { return 9; }; _ -> {}; }
+  match (size <= 384) { true -> { return 10; }; _ -> {}; }
+  match (size <= 512) { true -> { return 11; }; _ -> {}; }
+  match (size <= 768) { true -> { return 12; }; _ -> {}; }
+  match (size <= 1024) { true -> { return 13; }; _ -> {}; }
+  match (size <= 2048) { true -> { return 14; }; _ -> {}; }
+  return 15;
+}
+
+// Payload capacity of a size class.
+~> __heap_class_size(c:int) -> int {
+  match (c < 8) { true -> { return (c + 1) * 16; }; _ -> {}; }
+  match (c == 8) { true -> { return 192; }; _ -> {}; }
+  match (c == 9) { true -> { return 256; }; _ -> {}; }
+  match (c == 10) { true -> { return 384; }; _ -> {}; }
+  match (c == 11) { true -> { return 512; }; _ -> {}; }
+  match (c == 12) { true -> { return 768; }; _ -> {}; }
+  match (c == 13) { true -> { return 1024; }; _ -> {}; }
+  match (c == 14) { true -> { return 2048; }; _ -> {}; }
+  return 4096;
+}
+
+// Acquire/release the heap spin lock (lock word at ctl+0).
+~> __heap_lock(ctl:rawptr) -> void {
+  flow spinning:bool = true;
+  loop (spinning) {
+    rock got:int = __otter_cas64(ctl, 0, 1);
+    match (got == 0) { true -> { spinning = false; }; _ -> {}; }
+  }
+}
+
+~> __heap_unlock(ctl:rawptr) -> void {
+  __otter_atomic_store64(ctl, 0);
+}
+
+/**
+ * Allocates a contiguous block of memory (zero-filled).
  * On Windows, uses VirtualAlloc with MEM_COMMIT (0x1000) and PAGE_READWRITE (4).
- * On Linux/macOS, uses mmap with PROT_READ|PROT_WRITE and MAP_PRIVATE|MAP_ANONYMOUS.
- * Unix allocations carry a 16-byte header: [size][liveness-magic]. The magic
- * (2004318071) lets free() detect double-frees; the returned pointer is offset
- * past the header so free() can recover the mapping base + length.
- * @param size  Number of usable bytes to allocate
+ * On Linux/macOS, small sizes (<= 4096) come from size-class freelists over
+ * 64 KiB mmap arenas; larger sizes map straight through to mmap. See the
+ * heap comment above for the header format and locking rules.
+ * @param size  Number of usable bytes to allocate (minimum 1)
  * @returns     Pointer to the usable region, or null on failure
  */
 ~> alloc(size:int) -> rawptr {
-  flow p:rawptr = null;
   match (PLATFORM) {
-    1 -> {
-      p = VirtualAlloc(null, size, 4096, 4);
-      return p;
-    };
-    0 -> {
-      p = __linux_mmap(null, size + 16, 3, 34, -1, 0);
-    };
-    2 -> {
-      p = __macos_mmap(null, size + 16, 3, 4098, -1, 0);
-    };
-    _ -> {
-      p = VirtualAlloc(null, size, 4096, 4);
-      return p;
-    };
+    1 -> { return VirtualAlloc(null, size, 4096, 4); };
+    0 -> {};
+    2 -> {};
+    _ -> { return VirtualAlloc(null, size, 4096, 4); };
   }
 
-  match (p == null) {
+  flow want:int = size;
+  match (want < 1) { true -> { want = 1; }; _ -> {}; }
+
+  // Large allocations: straight mmap, class id 63, word0 holds mmap length.
+  match (want > 4096) {
     true -> {
-      return null;
+      rock total:int = want + 16;
+      rock big:rawptr = __heap_mmap(total);
+      match (big == null) { true -> { return null; }; _ -> {}; }
+      *big = total * 64 + 63;
+      rock bmagic:rawptr = big @ 8;
+      *bmagic = 2004318071;
+      return big @ 16;
     };
-    _ -> {
-      *p = size;              // header[0] = size
-      rock magic_slot:rawptr = p @ 8;
-      *magic_slot = 2004318071;  // header[1] = LIVE magic (0x77777777)
-      return p @ 16;
-    };
+    _ -> {};
   }
+
+  // Lazy init: first allocation is always on the main thread.
+  match (__heap_ctl == 0) {
+    true -> {
+      rock cb:rawptr = __heap_mmap(4096);
+      match (cb == null) { true -> { return null; }; _ -> {}; }
+      __heap_ctl = (int)cb;
+    };
+    _ -> {};
+  }
+  rock ctl:rawptr = (rawptr)__heap_ctl;
+
+  rock c:int = __heap_class(want);
+  rock csize:int = __heap_class_size(c);
+
+  __heap_lock(ctl);
+
+  // 1. Freelist hit: pop, re-zero the payload, restamp the header.
+  rock head_slot:rawptr = ctl @ (8 + c * 8);
+  rock head:int = *head_slot;
+  match (head != 0) {
+    true -> {
+      rock blk:rawptr = (rawptr)head;
+      *head_slot = *blk;              // next pointer lives in payload word 0
+      __heap_unlock(ctl);
+      flow z:int = 0;
+      loop (z < csize) {
+        rock zp:rawptr = blk @ z;
+        *zp = 0;
+        z += 8;
+      }
+      rock hdr:rawptr = blk @ -16;
+      *hdr = csize * 64 + c;
+      rock hmagic:rawptr = hdr @ 8;
+      *hmagic = 2004318071;
+      return blk;
+    };
+    _ -> {};
+  }
+
+  // 2. Bump-allocate from the class's current chunk (fresh mmap memory is
+  //    already zeroed, so no memset here).
+  rock stride:int = csize + 16;
+  rock bump_slot:rawptr = ctl @ (136 + c * 8);
+  rock end_slot:rawptr = ctl @ (264 + c * 8);
+  flow cur:int = *bump_slot;
+  rock limit:int = *end_slot;
+  match (cur == 0 || cur + stride > limit) {
+    true -> {
+      rock chunk:rawptr = __heap_mmap(65536);
+      match (chunk == null) {
+        true -> { __heap_unlock(ctl); return null; };
+        _ -> {};
+      }
+      cur = (int)chunk;
+      *end_slot = cur + 65536;
+    };
+    _ -> {};
+  }
+  *bump_slot = cur + stride;
+  __heap_unlock(ctl);
+
+  rock base:rawptr = (rawptr)cur;
+  *base = csize * 64 + c;
+  rock magic_slot:rawptr = base @ 8;
+  *magic_slot = 2004318071;
+  return base @ 16;
 }
 
 /**
  * Releases a previously allocated memory block.
  * On Windows, calls VirtualFree with MEM_RELEASE (0x8000).
- * On Linux/macOS, recovers the mmap base from the 16-byte header, verifies the
- * liveness magic (panics on a double-free / corrupted block), clears it, then
- * munmaps. Passing null is a safe no-op.
+ * On Linux/macOS, verifies the liveness magic (a block that is already FREE
+ * panics as a double free; anything else panics as corruption), marks the
+ * block FREE, then either pushes it onto its size-class freelist or, for
+ * large blocks, munmaps it. Passing null is a safe no-op.
  * @param ptr  Pointer obtained from alloc(), or null
  */
 ~> free(ptr:rawptr) {
   match (ptr == null) {
+    true -> { return; };
+    _ -> {};
+  }
+
+  match (PLATFORM) {
+    1 -> { VirtualFree(ptr, 0, 32768); return; };
+    _ -> {};
+  }
+
+  rock base:rawptr = ptr @ -16;
+  rock magic_slot:rawptr = base @ 8;
+  rock magic:int = *magic_slot;
+  match (magic == 2004318071) {
+    true -> {};
+    _ -> {
+      match (magic == 1717986918) {
+        true -> { __otter_panic("otter: double free\n", 134); };
+        _ -> { __otter_panic("otter: heap corruption (freeing an invalid pointer)\n", 134); };
+      }
+    };
+  }
+  *magic_slot = 1717986918;
+
+  rock word0:int = *base;
+  rock c:int = word0 % 64;
+
+  // Large block: give the pages back.
+  match (c == 63) {
     true -> {
+      rock total:int = word0 / 64;
+      match (PLATFORM) {
+        0 -> { __linux_munmap(base, total); };
+        2 -> { __macos_munmap(base, total); };
+        _ -> {};
+      }
       return;
     };
     _ -> {};
   }
 
-  match (PLATFORM) {
-    1 -> {
-      VirtualFree(ptr, 0, 32768);
-    };
-    _ -> {
-      rock base:rawptr = ptr @ -16;
-      rock magic_slot:rawptr = base @ 8;
-      rock magic:int = *magic_slot;
-      match (magic == 2004318071) {
-        true -> {};
-        _ -> { __otter_panic("otter: double free or heap corruption\n", 134); };
-      }
-      *magic_slot = 0;             // clear magic so a second free is caught
-      rock sz:int = *base;
-      match (PLATFORM) {
-        0 -> { __linux_munmap(base, sz + 16); };
-        2 -> { __macos_munmap(base, sz + 16); };
-        _ -> {};
-      }
-    };
-  }
+  // Small block: push onto its class freelist (next pointer in payload).
+  rock ctl:rawptr = (rawptr)__heap_ctl;
+  __heap_lock(ctl);
+  rock head_slot:rawptr = ctl @ (8 + c * 8);
+  *ptr = *head_slot;
+  *head_slot = (int)ptr;
+  __heap_unlock(ctl);
 }
 
 /**

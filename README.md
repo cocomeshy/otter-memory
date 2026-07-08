@@ -24,17 +24,17 @@ otter pkg pull
 
 ### `memory.alloc(size:int) -> rawptr`
 
-Allocates a contiguous block of memory. On Windows, uses VirtualAlloc with MEM_COMMIT (0x1000) and PAGE_READWRITE (4). On Linux/macOS, uses mmap with PROT_READ|PROT_WRITE and MAP_PRIVATE|MAP_ANONYMOUS. Unix allocations carry a 16-byte header: [size][liveness-magic]. The magic (2004318071) lets free() detect double-frees; the returned pointer is offset past the header so free() can recover the mapping base + length.
+Allocates a contiguous block of memory (zero-filled). On Windows, uses VirtualAlloc with MEM_COMMIT (0x1000) and PAGE_READWRITE (4). On Linux/macOS, small sizes (<= 4096) come from size-class freelists over 64 KiB mmap arenas; larger sizes map straight through to mmap. See the heap comment above for the header format and locking rules.
 
 Parameters:
 
-- `size`: Number of usable bytes to allocate
+- `size`: Number of usable bytes to allocate (minimum 1)
 
 Returns: Pointer to the usable region, or null on failure
 
 ### `memory.free(ptr:rawptr)`
 
-Releases a previously allocated memory block. On Windows, calls VirtualFree with MEM_RELEASE (0x8000). On Linux/macOS, recovers the mmap base from the 16-byte header, verifies the liveness magic (panics on a double-free / corrupted block), clears it, then munmaps. Passing null is a safe no-op.
+Releases a previously allocated memory block. On Windows, calls VirtualFree with MEM_RELEASE (0x8000). On Linux/macOS, verifies the liveness magic (a block that is already FREE panics as a double free; anything else panics as corruption), marks the block FREE, then either pushes it onto its size-class freelist or, for large blocks, munmaps it. Passing null is a safe no-op.
 
 Parameters:
 
