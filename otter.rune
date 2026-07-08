@@ -1,6 +1,6 @@
 rune 1
 name "memory"
 version "1.0.0"
-description "Standard library memory package"
+description "Manual memory allocation and low-level string helpers"
 author "cocomeshy"
 license "MIT"

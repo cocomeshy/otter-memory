@@ -1,97 +1,73 @@
-# memory
+# otter-memory
 
-Cross-platform memory allocation and string helpers for Otter.
+Manual memory allocation and low-level string helpers.
 
-Uses `VirtualAlloc`/`VirtualFree` on Windows, `mmap`/`munmap` on Linux/macOS — no libc dependency.
+Part of the Otter standard library. Otter is a compiled systems language with no garbage collector and no libc dependency (pthread for threading is the one exception); everything else goes through raw syscalls and DLL imports.
+
+## Install
+
+In your `otter.nest`:
+
+```nest
+deps {
+  use "memory" want "1.0.0"
+}
+```
+
+Then:
+
+```sh
+otter pkg pull
+```
 
 ## API reference
 
 ### `memory.alloc(size:int) -> rawptr`
 
-Allocate `size` bytes of memory. Returns a raw pointer to the allocated block.
+Allocates a contiguous block of memory. On Windows, uses VirtualAlloc with MEM_COMMIT (0x1000) and PAGE_READWRITE (4). On Linux/macOS, uses mmap with PROT_READ|PROT_WRITE and MAP_PRIVATE|MAP_ANONYMOUS. Unix allocations carry a 16-byte header: [size][liveness-magic]. The magic (2004318071) lets free() detect double-frees; the returned pointer is offset past the header so free() can recover the mapping base + length.
 
-- **Parameters:** `size` — Number of bytes to allocate (minimum 1)
-- **Returns:** `rawptr` to the allocated memory, or null on failure
-- **Platform:** `VirtualAlloc` (Windows), `mmap` (Linux/macOS)
+Parameters:
 
-```otter
-rock buf:rawptr = memory.alloc(1024);
-defer memory.free(buf);
-```
+- `size`: Number of usable bytes to allocate
 
----
+Returns: Pointer to the usable region, or null on failure
 
-### `memory.free(ptr:rawptr) -> void`
+### `memory.free(ptr:rawptr)`
 
-Release memory previously allocated with `alloc`.
+Releases a previously allocated memory block. On Windows, calls VirtualFree with MEM_RELEASE (0x8000). On Linux/macOS, recovers the mmap base from the 16-byte header, verifies the liveness magic (panics on a double-free / corrupted block), clears it, then munmaps. Passing null is a safe no-op.
 
-- **Parameters:** `ptr` — Pointer returned by a previous `alloc` call (or null)
-- **Platform:** `VirtualFree` (Windows), `munmap` (Linux/macOS)
+Parameters:
 
-```otter
-rock buf:rawptr = memory.alloc(64);
-memory.free(buf);
-```
-
----
+- `ptr`: Pointer obtained from alloc(), or null
 
 ### `memory.memcpy(dst:rawptr, src:rawptr, n:int) -> rawptr`
 
-Copy `n` bytes from `src` to `dst`. Regions must not overlap.
+Copies n bytes from src to dst, returning dst. On Windows, delegates to kernel32 RtlMoveMemory. On Unix, performs a manual 8-byte-word copy loop followed by a partial-word copy for any remaining bytes using bitmask merging.
 
-- **Returns:** `dst`
-- **Platform:** `RtlMoveMemory` (Windows), byte/word loop (Unix)
+Parameters:
 
-```otter
-rock src:rawptr = memory.alloc(16);
-rock dst:rawptr = memory.alloc(16);
-memory.memcpy(dst, src, 16);
-```
+- `dst`: Destination pointer
+- `src`: Source pointer
+- `n`: Number of bytes to copy
 
----
+Returns: The destination pointer
 
 ### `memory.strlen(text:str) -> int`
 
-Byte length of a null-terminated string (excluding the terminator).
+Returns the byte length of a null-terminated string, excluding the terminator. On Windows, delegates to kernel32 lstrlenA. On Unix, performs a manual byte-by-byte scan checking for a zero byte by masking each 8-byte word with 0xFF.
 
-```otter
-rock len:int = memory.strlen("hello");  // 5
-```
+Parameters:
 
----
+- `text`: The null-terminated string to measure
 
-### `memory.str_from_int(value:int) -> str`
-
-Allocate a new null-terminated string with the decimal representation of `value` (handles zero and negatives).
-
-```otter
-rock s:str = memory.str_from_int(-42);
-```
+Returns: Number of bytes before the null terminator
 
 ---
-
-### `memory.str_concat(a:str, b:str) -> str`
-
-Allocate a new string containing `a` followed by `b`, null-terminated. The result must be freed when you no longer need it (same as other `alloc`-backed strings).
-
-```otter
-rock s:str = memory.str_concat("hello", "world");
-```
-
-The compiler also lowers `ptr + ptr` (including f-strings like `$"x {n}"`) to this function when `use memory` is in scope and `pkg/memory` includes `str_concat`.
-
-## Language integration
-
-- **Cast `(str)some_int`** — The compiler may emit its own small helper for literals; for full control, use `memory.str_from_int`.
-- **String `+` and f-strings** — Require `memory.str_concat` in the linked program (add `use memory`, ensure `pkg/memory` is complete, run `otter pkg pull`).
 
 ## Dependencies
 
-None — this is the lowest-level standard package.
+none, this is the lowest-level package.
 
-## Install
+## License
 
-```bash
-otter pkg add memory
-otter pkg pull
-```
+MIT.
